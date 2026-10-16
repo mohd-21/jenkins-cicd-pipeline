@@ -1,0 +1,13 @@
+.git
+.github
+jenkins
+scripts
+docker-compose.yml
+Jenkinsfile
+__pycache__
+*.pyc
+.pytest_cache
+.venv
+coverage.xml
+junit.xml
+.env

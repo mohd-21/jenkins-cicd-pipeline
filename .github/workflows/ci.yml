@@ -1,0 +1,89 @@
+name: CI
+
+# The real pipeline runs in Jenkins. This workflow proves the repository itself is sound:
+# the app tests pass, the images build, the shell scripts are clean, the compose file is valid,
+# and the Jenkins server boots from its as-code config and accepts the Jenkinsfile.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  app-tests:
+    name: App tests and coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest --cov --cov-report=term -q
+
+  docker-images:
+    name: Docker images build and run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test stage (runs pytest inside the build)
+        run: docker build --target test -t task-api:test .
+      - name: Runtime stage
+        run: docker build --target runtime --build-arg APP_VERSION=ci -t task-api:ci .
+      - name: Container answers /health
+        run: |
+          docker run -d --name app -p 8000:8000 task-api:ci
+          for i in $(seq 1 15); do
+            curl -fsS http://localhost:8000/health && exit 0
+            sleep 2
+          done
+          docker logs app
+          exit 1
+
+  scripts-and-compose:
+    name: Shell scripts and compose file
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck scripts/*.sh
+      - run: |
+          cp .env.example .env
+          docker compose config --quiet
+
+  jenkins-boots:
+    name: Jenkins boots from code and accepts the Jenkinsfile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the Jenkins image (installs plugins)
+        run: docker build -t jenkins-casc ./jenkins
+      - name: Start Jenkins
+        run: |
+          docker run -d --name jenkins-smoke -p 8080:8080 \
+            -e JENKINS_ADMIN_PASSWORD=ci-test-password jenkins-casc
+      - name: Wait until Jenkins is ready
+        run: |
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/login || true)
+            if [ "$code" = "200" ]; then echo "Jenkins is up"; exit 0; fi
+            sleep 5
+          done
+          docker logs jenkins-smoke | tail -100
+          exit 1
+      - name: Seed job was created by Configuration as Code
+        run: |
+          curl -fsS -u admin:ci-test-password http://localhost:8080/job/task-api/api/json \
+            | grep -q '"name":"task-api"'
+      - name: Jenkinsfile passes the declarative linter
+        run: |
+          J=http://localhost:8080
+          CRUMB=$(curl -fsS -c jar -u admin:ci-test-password \
+            "$J/crumbIssuer/api/xml?xpath=concat(//crumbRequestField,%22:%22,//crumb)")
+          out=$(curl -fsS -b jar -u admin:ci-test-password -H "$CRUMB" -X POST \
+            -F "jenkinsfile=<Jenkinsfile" "$J/pipeline-model-converter/validate")
+          echo "$out"
+          echo "$out" | grep -q "successfully validated"
+      - name: Jenkins logs (on failure)
+        if: failure()
+        run: docker logs jenkins-smoke | tail -150
